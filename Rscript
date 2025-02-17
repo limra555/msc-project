@@ -1,0 +1,177 @@
+# Load required libraries
+if (!requireNamespace("BiocManager", quietly = TRUE))
+  install.packages("BiocManager")
+
+BiocManager::install(c("TCGAbiolinks","biomaRt", "clusterProfiler", "org.Hs.eg.db"), force = TRUE)
+
+library(TCGAbiolinks)
+library(SummarizedExperiment)
+library(DESeq2)
+library(biomaRt)
+library(clusterProfiler)
+library(org.Hs.eg.db)
+library(ggplot2)
+BiocManager::install("DESeq2", force = TRUE)
+install.packages("cli", dependencies = TRUE)
+
+# Set working directory
+setwd("C:/Users/limra/OneDrive/Documents/Project/")
+
+# Query and download TCGA-LUAD RNA-seq data
+query_LUAD <- GDCquery(
+  project = "TCGA-LUAD",
+  data.category = "Transcriptome Profiling",
+  data.type = "Gene Expression Quantification",
+  experimental.strategy = "RNA-Seq",
+  workflow.type = "STAR - Counts",
+  access = "open"
+)
+
+GDCdownload(query_LUAD)
+luad_data <- GDCprepare(query_LUAD, summarizedExperiment = TRUE)
+
+# Extract gene expression matrix
+expression_matrix <- assay(luad_data, "unstranded")
+
+
+# Load sample metadata for DESeq2
+metadata <- colData(luad_data)
+# Convert 'sample_type' to a factor explicitly
+colData(luad_data)$sample_type <- as.factor(colData(luad_data)$sample_type)
+
+# Now create the DESeqDataSet again
+dds <- DESeqDataSetFromMatrix(countData = expression_matrix,
+                              colData = colData(luad_data),  
+                              design = ~sample_type)
+
+# Run DESeq2 analysis
+dds <- DESeq(dds)
+
+# Get results of DEG analysis
+res <- results(dds)
+
+# Write DEGs to a CSV file
+df_degs <- as.data.frame(res)
+write.csv(df_degs, "1_DEGs_all.csv", row.names = TRUE)
+
+
+# Load precomputed DEGs (Replace with actual DEG analysis if needed)
+df_degs <- read.csv("1_DEGs_all.csv")
+
+# Filter DEGs based on adjusted p-value and log2FoldChange threshold
+df_degs <- subset(df_degs, df_degs$padj < 0.01 & abs(df_degs$log2FoldChange) > 2.5)
+
+# Annotate DEGs with gene biotype using biomaRt
+mart <- useDataset("hsapiens_gene_ensembl", useMart("ensembl"))
+
+gene_info <- getBM(filters= 'ensembl_gene_id', 
+                   attributes= c('ensembl_gene_id', 'hgnc_symbol', 'gene_biotype'), 
+                   values=df_degs$gene, mart= mart)
+
+# Merge annotation with DEG data
+df_degs <- merge(df_degs, gene_info, by = "ensembl_gene_id", all.x = TRUE)
+
+# Filter for protein-coding genes only
+df_protein_coding <- subset(df_degs, gene_biotype == "protein_coding")
+
+# Separate Up- and Down-Regulated Protein-Coding Genes
+up_protein <- subset(df_protein_coding, log2FoldChange > 2)
+down_protein <- subset(df_protein_coding, log2FoldChange < -2)
+
+# Save processed data
+write.csv(df_protein_coding, "7_DEGs_proteinCodingGenes_All.csv", row.names = FALSE)
+write.csv(up_protein, "8_up_proteinCodingGenes_All.csv", row.names = FALSE)
+write.csv(down_protein, "9_down_proteinCodingGenes_All.csv", row.names = FALSE)
+
+# Count number of up-regulated and down-regulated protein-coding genes
+num_up_protein <- nrow(up_protein)
+num_down_protein <- nrow(down_protein)
+num_total_protein <- nrow(df_protein_coding)
+
+# Print the numbers
+cat("Number of up-regulated protein-coding genes: ", num_up_protein, "\n")
+cat("Number of down-regulated protein-coding genes: ", num_down_protein, "\n")
+cat("Total number of protein-coding genes: ", num_total_protein, "\n")
+
+
+library(ggplot2)
+
+# Define threshold values for significance
+df_protein_coding$Significance <- "Not Significant"
+df_protein_coding$Significance[df_protein_coding$padj < 0.01 & df_protein_coding$log2FoldChange > 2.5] <- "Upregulated"
+df_protein_coding$Significance[df_protein_coding$padj < 0.01 & df_protein_coding$log2FoldChange < -2.5] <- "Downregulated"
+
+# Create Volcano Plot
+volcano_plot <- ggplot(df_protein_coding, aes(x = log2FoldChange, y = -log10(padj), color = Significance)) +
+  geom_point(alpha = 0.7) +
+  scale_color_manual(values = c("Not Significant" = "grey", "Upregulated" = "red", "Downregulated" = "blue")) +
+  labs(title = "Volcano Plot of Protein-Coding DEGs",
+       x = "Log2 Fold Change",
+       y = "-Log10 Adjusted P-value") +
+  theme_minimal()
+
+# Save Plot
+ggsave("VolcanoPlot_ProteinCoding.png", plot = volcano_plot, width = 8, height = 6)
+
+# Show Plot
+print(volcano_plot)
+
+# ===============================================================
+# Functional Enrichment Analysis (GO & KEGG) for Protein-Coding DEGs
+# ===============================================================
+
+# Convert gene symbols to Entrez IDs
+gene_symbols <- df_protein_coding$hgnc_symbol
+gene_entrez <- bitr(gene_symbols, fromType="SYMBOL", toType="ENTREZID", OrgDb="org.Hs.eg.db")
+
+# GO Enrichment (Biological Process)
+ego <- enrichGO(gene         = gene_entrez$ENTREZID,
+                OrgDb        = org.Hs.eg.db,
+                keyType      = "ENTREZID",
+                ont          = "BP",
+                pAdjustMethod = "BH",
+                pvalueCutoff = 0.05)
+
+# Save GO results
+write.csv(as.data.frame(ego), "10_GO_Enrichment_ProteinCoding.csv", row.names = FALSE)
+
+# KEGG Pathway Enrichment
+ekegg <- enrichKEGG(gene         = gene_entrez$ENTREZID,
+                    organism     = 'hsa',
+                    pvalueCutoff = 0.05)
+
+# Save KEGG results
+write.csv(as.data.frame(ekegg), "11_KEGG_Enrichment_ProteinCoding.csv", row.names = FALSE)
+
+# ===============================================================
+# Plot Enrichment Results
+# ===============================================================
+
+# GO Bar Plot
+barplot(ego, showCategory=10, title="GO Enrichment (Biological Process)")
+
+# KEGG Dot Plot
+dotplot(ekegg, showCategory=10, title="KEGG Pathway Enrichment")
+
+
+# Install and load necessary packages
+BiocManager::install("ReactomePA",force=TRUE)
+BiocManager::install("clusterProfiler",force=TRUE)
+
+library(ReactomePA)
+library(clusterProfiler)
+library(org.Hs.eg.db)
+
+# Convert gene symbols to Entrez IDs (as done earlier in your code)
+gene_symbols <- df_protein_coding$hgnc_symbol
+gene_entrez <- bitr(gene_symbols, fromType="SYMBOL", toType="ENTREZID", OrgDb="org.Hs.eg.db")
+
+# Reactome Pathway Enrichment using ReactomePA
+reactome_enrich <- enrichPathway(gene         = gene_entrez$ENTREZID,
+                                 pvalueCutoff = 0.05)
+
+# Save Reactome results
+write.csv(as.data.frame(reactome_enrich), "12_Reactome_Enrichment_ProteinCoding.csv", row.names = FALSE)
+
+# Plot Reactome Enrichment
+dotplot(reactome_enrich, showCategory=10, title="Reactome Pathway Enrichment")
